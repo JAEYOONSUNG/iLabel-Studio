@@ -3199,8 +3199,10 @@ struct LivePagePreviewPanel: View {
                 onResetArea: { store.clearPlacementSelection() },
                 onEditBatch: { store.beginEditingPrintBatch(id: $0) },
                 onRepositionBatch: { store.beginMovingPrintBatch(id: $0) },
+                onMoveBatch: { store.moveCapturedBatch(id: $0, toSlot: $1) },
                 onRemoveBatch: { store.removePrintBatch(id: $0) },
-                onClearQueue: { store.clearPrintQueue() }
+                onClearQueue: { store.clearPrintQueue() },
+                isMoveArmed: store.printBatchMoveSession != nil
             )
             .equatable()
 
@@ -3239,14 +3241,19 @@ struct LivePagePreviewBody: View, Equatable {
     let onResetArea: () -> Void
     var onEditBatch: ((UUID) -> Void)? = nil
     var onRepositionBatch: ((UUID) -> Void)? = nil
+    var onMoveBatch: ((UUID, Int) -> Void)? = nil
     var onRemoveBatch: ((UUID) -> Void)? = nil
     var onClearQueue: (() -> Void)? = nil
+    var isMoveArmed = false
+
+    @State private var showsPrintSample = true
 
     static func == (lhs: LivePagePreviewBody, rhs: LivePagePreviewBody) -> Bool {
         lhs.document == rhs.document
             && lhs.pageIndex == rhs.pageIndex
             && lhs.draftPlan == rhs.draftPlan
             && lhs.pageCount == rhs.pageCount
+            && lhs.isMoveArmed == rhs.isMoveArmed
     }
 
     var body: some View {
@@ -3289,7 +3296,7 @@ struct LivePagePreviewBody: View, Equatable {
             }
 
             Text(document.hasQueuedLabels
-                ? "Blue labels are captured for print. Orange labels preview the next uncaptured setup."
+                ? "Blue labels are captured for print. Click one to preview it, drag it to move. Orange labels preview the next uncaptured setup."
                 : "This is the full-sheet layout that will be exported or printed.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
@@ -3305,14 +3312,24 @@ struct LivePagePreviewBody: View, Equatable {
                 onDragSlots: onDragSlots,
                 onEditBatch: onEditBatch,
                 onRepositionBatch: onRepositionBatch,
+                onMoveBatch: onMoveBatch,
                 onRemoveBatch: onRemoveBatch,
-                onClearQueue: onClearQueue
+                onClearQueue: onClearQueue,
+                isMoveArmed: isMoveArmed
             )
                 .padding(4)
                 .background(
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .fill(Color.white.opacity(0.8))
                 )
+                .overlay(alignment: .topTrailing) {
+                    // What the first captured label on this page will look
+                    // like on paper, drawn through the print path.
+                    if let firstSlot = capturedSlotList.min(), document.hasQueuedLabels {
+                        printSampleCard(slotIndex: firstSlot)
+                            .padding(8)
+                    }
+                }
 
             HStack {
                 Button("Reset", action: onResetArea)
@@ -3348,6 +3365,96 @@ struct LivePagePreviewBody: View, Equatable {
             }
         }
         .padding(14)
+    }
+}
+
+extension LivePagePreviewBody {
+    @ViewBuilder
+    fileprivate func printSampleCard(slotIndex: Int) -> some View {
+        if showsPrintSample {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Text("Print sample")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(document.coordinateLabel(for: slotIndex))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    Button {
+                        showsPrintSample = false
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .bold))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Hide print sample")
+                }
+                SlotPrintSampleView(
+                    document: document,
+                    slotIndex: slotIndex,
+                    pageIndex: pageIndex,
+                    displaySize: 120
+                )
+            }
+            .padding(10)
+            .frame(width: 148)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(.regularMaterial)
+                    .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+            )
+        } else {
+            Button {
+                showsPrintSample = true
+            } label: {
+                Label("Print sample", systemImage: "eye")
+                    .font(.system(size: 11))
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Show how the first captured label prints")
+        }
+    }
+}
+
+/// One slot drawn exactly as the printer receives it (no preview tint,
+/// borders or dimming), with a hairline showing the label's cut edge.
+struct SlotPrintSampleView: View {
+    let document: LabelDocument
+    let slotIndex: Int
+    let pageIndex: Int
+    let displaySize: CGFloat
+
+    var body: some View {
+        let sheet = document.sheet
+        let longest = max(sheet.labelWidthMM, sheet.labelHeightMM)
+        let scale = longest > 0 ? displaySize / CGFloat(longest) : 1
+        let payload = document.renderPayload(slotIndex: slotIndex, pageIndex: pageIndex)
+        let surface = LabelSurface(shape: sheet.shape, cornerRadiusMM: sheet.cornerRadiusMM)
+
+        VStack(spacing: 4) {
+            LabelSlotView(
+                document: document,
+                elements: payload.elements,
+                context: payload.context,
+                serialSettings: payload.serialSettings,
+                unitScale: scale,
+                showGuides: false,
+                applyPreviewChrome: false
+            )
+            .frame(
+                width: scaled(sheet.labelWidthMM, by: scale),
+                height: scaled(sheet.labelHeightMM, by: scale)
+            )
+            .overlay(surface.stroke(Color.black.opacity(0.25), lineWidth: 0.75))
+            .environment(\.colorScheme, .light)
+
+            Text(String(format: "%.2f × %.2f mm", sheet.labelWidthMM, sheet.labelHeightMM))
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
     }
 }
 
@@ -3395,16 +3502,28 @@ struct InteractivePagePreviewCanvas: View {
     let onDragSlots: (Int, Int) -> Void
     var onEditBatch: ((UUID) -> Void)? = nil
     var onRepositionBatch: ((UUID) -> Void)? = nil
+    var onMoveBatch: ((UUID, Int) -> Void)? = nil
     var onRemoveBatch: ((UUID) -> Void)? = nil
     var onClearQueue: (() -> Void)? = nil
+    var isMoveArmed = false
 
     @State private var dragStartSlot: Int?
+    /// Captured batch being dragged to a new start position, and the slot
+    /// under the pointer while it is.
+    @State private var draggingBatchID: UUID?
+    @State private var dropTargetSlot: Int?
+    /// Captured slot whose print sample is shown in the popover.
+    @State private var inspectedSlot: Int?
+    @State private var showsSlotInspector = false
+
+    private static let coordinateSpaceName = "interactivePagePreview"
+    private let labelInset: CGFloat = 24
 
     var body: some View {
         GeometryReader { proxy in
             let width = document.sheet.pageWidthMM
             let height = document.sheet.pageHeightMM
-            let labelInset: CGFloat = 24
+            let labelInset = self.labelInset
             let scale = min((proxy.size.width - labelInset) / width, (proxy.size.height - labelInset) / height) * 0.96
 
             ZStack(alignment: .topLeading) {
@@ -3466,22 +3585,47 @@ struct InteractivePagePreviewCanvas: View {
                             y: labelInset + scaled(frame.y + (frame.height / 2), by: scale)
                         )
                         .gesture(
-                            DragGesture(minimumDistance: 0)
+                            DragGesture(
+                                minimumDistance: 0,
+                                coordinateSpace: .named(Self.coordinateSpaceName)
+                            )
                                 .onChanged { value in
                                     if dragStartSlot == nil {
                                         dragStartSlot = slotIndex
                                     }
                                     let isDragging = abs(value.translation.width) >= 2
                                         || abs(value.translation.height) >= 2
-                                    if isDragging, let dragStartSlot {
-                                        onDragSlots(dragStartSlot, slotIndex)
+                                    guard isDragging, let dragStartSlot else { return }
+                                    let hovered = self.slotIndex(at: value.location, scale: scale)
+                                    // Dragging a captured label moves it; dragging
+                                    // from an empty slot selects an area.
+                                    if let capturedBatchID, !isMoveArmed {
+                                        draggingBatchID = capturedBatchID
+                                        dropTargetSlot = hovered
+                                    } else {
+                                        onDragSlots(dragStartSlot, hovered ?? dragStartSlot)
                                     }
                                 }
                                 .onEnded { value in
-                                    if abs(value.translation.width) < 2 && abs(value.translation.height) < 2 {
-                                        onTapSlot(slotIndex)
+                                    let isTap = abs(value.translation.width) < 2
+                                        && abs(value.translation.height) < 2
+                                    if isTap {
+                                        if capturedBatchID != nil, !isMoveArmed {
+                                            inspectedSlot = slotIndex
+                                            showsSlotInspector = true
+                                        } else {
+                                            onTapSlot(slotIndex)
+                                        }
+                                    } else if let draggingBatchID,
+                                              let grabbed = dragStartSlot,
+                                              let dropped = self.slotIndex(at: value.location, scale: scale),
+                                              let start = batchStartSlot(draggingBatchID),
+                                              let target = shiftedSlot(start, by: grabbed, to: dropped) {
+                                        onMoveBatch?(draggingBatchID, target)
                                     }
                                     dragStartSlot = nil
+                                    draggingBatchID = nil
+                                    dropTargetSlot = nil
                                 }
                         )
 
@@ -3520,9 +3664,138 @@ struct InteractivePagePreviewCanvas: View {
                         slotHitArea
                     }
                 }
+
+                ForEach(dropFootprint, id: \.self) { footprintSlot in
+                    let frame = slotFrame(for: footprintSlot)
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [4, 2]))
+                        .background(
+                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                .fill(Color.accentColor.opacity(0.18))
+                        )
+                        .frame(
+                            width: scaled(frame.width, by: scale) + 4,
+                            height: scaled(frame.height, by: scale) + 4
+                        )
+                        .position(
+                            x: labelInset + scaled(frame.x + (frame.width / 2), by: scale),
+                            y: labelInset + scaled(frame.y + (frame.height / 2), by: scale)
+                        )
+                        .allowsHitTesting(false)
+                }
+
+                // Single anchor for the slot inspector popover; it sits on the
+                // inspected slot so the popover opens immediately to its left.
+                let anchorFrame = slotFrame(for: inspectedSlot ?? 0)
+                Color.clear
+                    .frame(width: scaled(anchorFrame.width, by: scale), height: scaled(anchorFrame.height, by: scale))
+                    .position(
+                        x: labelInset + scaled(anchorFrame.x + (anchorFrame.width / 2), by: scale),
+                        y: labelInset + scaled(anchorFrame.y + (anchorFrame.height / 2), by: scale)
+                    )
+                    .allowsHitTesting(false)
+                    .popover(isPresented: $showsSlotInspector, arrowEdge: .leading) {
+                        if let inspectedSlot {
+                            slotInspector(slotIndex: inspectedSlot)
+                        }
+                    }
             }
+            .coordinateSpace(name: Self.coordinateSpaceName)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    /// Slots the dragged batch would cover if dropped now: its slots on this
+    /// page, shifted by the same rows/columns the pointer has moved.
+    private var dropFootprint: [Int] {
+        guard let draggingBatchID, let grabbed = dragStartSlot, let dropTargetSlot else { return [] }
+        return (0..<document.totalSlotCount).compactMap { slot in
+            guard document.renderPayload(slotIndex: slot, pageIndex: pageIndex).batchID == draggingBatchID
+            else { return nil }
+            return shiftedSlot(slot, by: grabbed, to: dropTargetSlot)
+        }
+    }
+
+    private func batchStartSlot(_ batchID: UUID) -> Int? {
+        if let batch = document.printBatches.first(where: { $0.id == batchID }),
+           let start = document.capturedStartPosition(for: batch),
+           start.pageIndex == pageIndex {
+            return start.slotIndex
+        }
+        return (0..<document.totalSlotCount).first {
+            document.renderPayload(slotIndex: $0, pageIndex: pageIndex).batchID == batchID
+        }
+    }
+
+    /// `slot` moved by the row/column offset from `from` to `to`, or nil if
+    /// that lands off the sheet.
+    private func shiftedSlot(_ slot: Int, by from: Int, to: Int) -> Int? {
+        let columns = document.sheet.columns
+        guard columns > 0 else { return nil }
+        let row = slot / columns + (to / columns - from / columns)
+        let column = slot % columns + (to % columns - from % columns)
+        guard (0..<document.sheet.rows).contains(row), (0..<columns).contains(column) else { return nil }
+        return row * columns + column
+    }
+
+    private func slotFrame(for slotIndex: Int) -> RectMM {
+        let columns = max(1, document.sheet.columns)
+        return document.sheet.slotFrame(column: slotIndex % columns, row: slotIndex / columns)
+    }
+
+    /// Slot under a point in the canvas coordinate space, if any.
+    private func slotIndex(at point: CGPoint, scale: CGFloat) -> Int? {
+        guard scale > 0 else { return nil }
+        let x = Double((point.x - labelInset) / scale)
+        let y = Double((point.y - labelInset) / scale)
+        for slotIndex in 0..<document.totalSlotCount {
+            let frame = slotFrame(for: slotIndex)
+            if x >= frame.x, x <= frame.x + frame.width,
+               y >= frame.y, y <= frame.y + frame.height {
+                return slotIndex
+            }
+        }
+        return nil
+    }
+
+    @ViewBuilder
+    private func slotInspector(slotIndex: Int) -> some View {
+        let batchID = document.renderPayload(slotIndex: slotIndex, pageIndex: pageIndex).batchID
+        let batchName = document.printBatches.first { $0.id == batchID }?.name
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Page \(pageIndex + 1) · \(document.coordinateLabel(for: slotIndex))")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+            }
+            if let batchName {
+                Text(batchName)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            SlotPrintSampleView(
+                document: document,
+                slotIndex: slotIndex,
+                pageIndex: pageIndex,
+                displaySize: 200
+            )
+            if let batchID {
+                HStack {
+                    Button("Edit") {
+                        showsSlotInspector = false
+                        onEditBatch?(batchID)
+                    }
+                    Spacer()
+                    Text("Drag on the sheet to move")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .controlSize(.small)
+            }
+        }
+        .padding(12)
+        .frame(width: 240)
     }
 }
 

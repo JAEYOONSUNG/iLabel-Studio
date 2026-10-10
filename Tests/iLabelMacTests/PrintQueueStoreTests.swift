@@ -525,4 +525,35 @@ final class PrintQueueStoreTests: XCTestCase {
             secondID
         )
     }
+
+    func testDraggingACaptureMovesItAndRejectsOccupiedSlots() throws {
+        let store = DocumentStore()
+        store.addElement(.text)
+        let elementID = try XCTUnwrap(store.selectedElementID)
+
+        store.document.serial.end = 2
+        store.updateTextElement(id: elementID, content: "FIRST {{serial}}", richTextRTF: nil)
+        store.enqueueCurrentLabel()
+
+        store.updateTextElement(id: elementID, content: "SECOND {{serial}}", richTextRTF: nil)
+        store.selectPlacementStart(at: 2)
+        store.enqueueCurrentLabel()
+
+        let firstID = try XCTUnwrap(store.document.printBatches.first?.id)
+        let secondID = try XCTUnwrap(store.document.printBatches.last?.id)
+
+        // Dropping onto another capture's slots leaves everything in place.
+        store.moveCapturedBatch(id: firstID, toSlot: 2)
+        XCTAssertNotNil(store.captureQueueIssue)
+        XCTAssertNil(store.printBatchMoveSession)
+        XCTAssertEqual(store.document.renderPayload(slotIndex: 0, pageIndex: 0).batchID, firstID)
+        XCTAssertEqual(store.document.renderPayload(slotIndex: 2, pageIndex: 0).batchID, secondID)
+
+        store.moveCapturedBatch(id: firstID, toSlot: 6)
+        XCTAssertNil(store.captureQueueIssue)
+        XCTAssertNil(store.document.renderPayload(slotIndex: 0, pageIndex: 0).batchID)
+        XCTAssertEqual(store.document.renderPayload(slotIndex: 6, pageIndex: 0).batchID, firstID)
+        XCTAssertEqual(store.document.renderPayload(slotIndex: 6, pageIndex: 0).context.serialValue, 1)
+        XCTAssertEqual(store.document.renderPayload(slotIndex: 2, pageIndex: 0).batchID, secondID)
+    }
 }

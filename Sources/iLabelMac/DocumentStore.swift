@@ -1090,6 +1090,32 @@ final class DocumentStore: ObservableObject {
         statusMessage = "Click an empty label position to move \(batch.name). Use Prev/Next to reach another page."
     }
 
+    /// Drag-and-drop counterpart of beginMovingPrintBatch + slot click: moves
+    /// the captured batch so it starts at `slotIndex` on the current page.
+    func moveCapturedBatch(id: UUID, toSlot slotIndex: Int) {
+        if let session = printBatchEditSession {
+            let message = "Finish editing \(session.batchName) first — Update Capture or Cancel."
+            captureQueueIssue = message
+            statusMessage = message
+            return
+        }
+        guard slotIndex >= 0, slotIndex < document.totalSlotCount else { return }
+        ensureLegacyQueueIsFrozen()
+        guard let batch = document.printBatches.first(where: { $0.id == id }) else {
+            statusMessage = "This capture is no longer in the queue."
+            return
+        }
+        if let start = document.capturedStartPosition(for: batch),
+           start.pageIndex == currentPageIndex,
+           start.slotIndex == slotIndex {
+            return
+        }
+        repositionPrintBatch(
+            PrintBatchMoveSession(batchID: batch.id, batchName: batch.name),
+            to: slotIndex
+        )
+    }
+
     func cancelPrintBatchMove() {
         guard printBatchMoveSession != nil else { return }
         printBatchMoveSession = nil
@@ -1105,11 +1131,18 @@ final class DocumentStore: ObservableObject {
         var moved = document.printBatches[queueIndex]
         let fillDirection = moved.capturedPlacement?.fillDirection
             ?? document.placement.fillDirection
+        let targetSlots: [Int]
+        switch movedSlotIndices(of: moved, to: slotIndex, fillDirection: fillDirection) {
+        case .some(let slots):
+            targetSlots = slots
+        case .none:
+            let message = "\(session.batchName) does not fit there — its area would run off the sheet."
+            captureQueueIssue = message
+            statusMessage = message
+            return
+        }
         moved.capturedPlacement = PlacementSettings(
-            selectedSlotIndices: document.slotIndicesStarting(
-                at: slotIndex,
-                fillDirection: fillDirection
-            ),
+            selectedSlotIndices: targetSlots,
             fillDirection: fillDirection
         )
         moved.startPageIndex = currentPageIndex
@@ -1141,6 +1174,38 @@ final class DocumentStore: ObservableObject {
         clampCurrentPageIndex()
         schedulePreviewRefresh(immediate: true)
         statusMessage = "Moved \(session.batchName) to page \(currentPageIndex + 1) \(document.coordinateLabel(for: slotIndex))"
+    }
+
+    /// Slots a moved batch occupies when it starts at `slotIndex`. A batch
+    /// captured into a hand-picked area keeps that area's shape (shifted by
+    /// whole rows/columns); one that flowed from a start position flows from
+    /// the new start. Returns nil when the shifted area leaves the sheet.
+    private func movedSlotIndices(
+        of batch: PrintBatch,
+        to slotIndex: Int,
+        fillDirection: PlacementFillDirection
+    ) -> [Int]? {
+        let flowing = document.slotIndicesStarting(at: slotIndex, fillDirection: fillDirection)
+        let columns = document.sheet.columns
+        let rows = document.sheet.rows
+        guard columns > 0, rows > 0,
+              let area = batch.capturedPlacement?.selectedSlotIndices,
+              let anchor = area.min()
+        else { return flowing }
+        let flowedFromAnchor = document.slotIndicesStarting(at: anchor, fillDirection: fillDirection)
+        if area.isEmpty || Set(area) == Set(flowedFromAnchor) {
+            return flowing
+        }
+        let rowDelta = (slotIndex / columns) - (anchor / columns)
+        let columnDelta = (slotIndex % columns) - (anchor % columns)
+        var shifted: [Int] = []
+        for index in area {
+            let row = (index / columns) + rowDelta
+            let column = (index % columns) + columnDelta
+            guard (0..<rows).contains(row), (0..<columns).contains(column) else { return nil }
+            shifted.append(row * columns + column)
+        }
+        return shifted
     }
 
     func removePrintBatch(id: UUID) {
